@@ -179,6 +179,42 @@ def build_bot() -> Nanobot:
     return Nanobot(loop)
 
 
+def build_loop() -> AgentLoop:
+    """构建 AgentLoop 实例（支持流式回调）"""
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "")
+    if not dashscope_key:
+        print("[Error] DASHSCOPE_API_KEY not set")
+        sys.exit(1)
+
+    config = load_config(WORKSPACE / "config.json")
+    config.providers.dashscope.api_key = dashscope_key
+    config.agents.defaults.workspace = str(WORKSPACE)
+
+    provider = _make_provider(config)
+    defaults = config.agents.defaults
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=WORKSPACE,
+        model=defaults.model,
+        max_iterations=defaults.max_tool_iterations,
+        context_window_tokens=defaults.context_window_tokens,
+        max_tool_result_chars=defaults.max_tool_result_chars,
+        web_config=config.tools.web,
+        exec_config=config.tools.exec,
+        restrict_to_workspace=False,
+        timezone=defaults.timezone,
+    )
+
+    loop.tools.register(ExcSQLTool(DB_PATH))
+    loop.tools.register(ArimaStockTool(DB_PATH))
+    loop.tools.register(BollDetectionTool(DB_PATH))
+    loop.tools.register(GetStockRealtimeTool(DB_PATH))
+
+    return loop
+
+
 async def main():
     question = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "贵州茅台2025年的收盘价走势如何？"
 

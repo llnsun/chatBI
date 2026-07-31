@@ -130,5 +130,6 @@ class ExcSQLTool(Tool):
 
         generate_chart_png(df, save_path)
 
-        img_md = f'![图表]({save_path})'
+        rel_path = f'image_show/{filename}'
+        img_md = f'![图表]({rel_path})'
         return f"{md}\n\n{img_md}"

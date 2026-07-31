@@ -1,0 +1,14 @@
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
+
+# 数据库文件
+*.db
+
+# 图表输出
+**/image_show/
+
+# 运行产物
+**/workspace/
+*.xlsx

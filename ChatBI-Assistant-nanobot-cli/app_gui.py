@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-股票查询助手 - Gradio Web UI
+股票查询助手 - Gradio Web UI（流式版）
 
 运行: python app_gui.py
-访问: http://localhost:7861
+访问: http://localhost:7868
 """
 
 import asyncio
 import os
+import queue
 import re
 import sys
+import threading
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -21,78 +23,112 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import gradio as gr
-from agent import (DB_PATH, DEFAULT_STOCKS, WORKSPACE,
-                   PrintHook, init_database, build_bot)
-
-_session_raw_history: list[dict] = []
+from agent import WORKSPACE, init_database, build_loop
 
 IMAGE_SHOW_DIR = WORKSPACE / "image_show"
 IMAGE_SHOW_DIR.mkdir(exist_ok=True)
 
 
-def _make_image_paths_absolute(text: str) -> str:
-    """将 Markdown 图片引用中的相对路径转为 Gradio file= 格式"""
+import base64
+
+def _fix_image_paths(text: str) -> str:
+    """修复图片路径：转为 base64 嵌入，确保 Gradio 可渲染"""
     def _replace(m):
-        alt = m.group(1) or "图片"
+        alt = m.group(1) or "图表"
         img_path = m.group(2)
-        if not os.path.isabs(img_path):
-            img_path = str(WORKSPACE / img_path)
-        img_path = os.path.normpath(img_path)
-        if os.path.exists(img_path):
-            return f"![{alt}](file={img_path})"
+        if img_path.startswith('file='):
+            img_path = img_path[5:]
+        p = Path(img_path)
+        if not p.is_absolute():
+            p = (WORKSPACE / p).resolve()
+        if p.exists():
+            with open(p, 'rb') as f:
+                b64_data = base64.b64encode(f.read()).decode('utf-8')
+            return f'![{alt}](data:image/png;base64,{b64_data})'
         else:
-            return f"_[图片未找到]_\n"
+            return f"_[图片未找到: {p.name}]_\n"
     return re.sub(r'!\[(.*?)\]\(([^)]+)\)', _replace, text)
 
 
-async def _do_chat(message: str) -> str:
-    """异步执行一次对话，返回响应文本"""
-    session_id = "gradio:default"
-    _session_raw_history.append({"role": "user", "content": message})
-
-    bot = build_bot()
-
-    if len(_session_raw_history) > 1:
-        context_parts = []
-        for h in _session_raw_history[:-1]:
-            role_label = "用户" if h["role"] == "user" else "助手"
-            context_parts.append(f"{role_label}: {h['content'][:500]}")
-        prompt = f"对话历史:\n{chr(10).join(context_parts)}\n\n用户最新问题: {message}"
-    else:
-        prompt = message
-
-    try:
-        result = await bot.run(prompt, session_key=session_id, hooks=[PrintHook()])
-        response_text = result.content or "抱歉，未能生成回复。"
-    except Exception as e:
-        response_text = f"处理请求时出错: {str(e)}"
-
-    _session_raw_history.append({"role": "assistant", "content": response_text})
-    return _make_image_paths_absolute(response_text)
-
-
 def chat_handler(message: str, history: list):
-    """同步包装，Gradio 事件回调"""
+    """流式对话处理器（Generator），支持：
+    1. 用户消息立即显示
+    2. 工具调用进度展示
+    3. LLM 输出逐字流式显示
+    """
     if not message or not message.strip():
         return history
 
-    # 用 asyncio 运行异步任务
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # 创建基础 history（包含用户消息），后续所有状态都基于此构建
+    base_history = list(history) + [{"role": "user", "content": message}]
+    yield base_history
 
-    response_text = loop.run_until_complete(_do_chat(message))
+    # 跨线程通信队列
+    q: queue.Queue = queue.Queue()
 
-    history.append({"role": "user", "content": message})
-    history.append({"role": "assistant", "content": response_text})
-    return history
+    def _run_agent():
+        """在独立线程中运行异步 agent"""
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+
+        async def _task():
+            agent_loop = build_loop()
+
+            async def on_progress(text: str, **kwargs):
+                q.put(("progress", text))
+
+            async def on_stream(delta: str):
+                q.put(("stream", delta))
+
+            async def on_stream_end(*, resuming: bool = False):
+                pass
+
+            result = await agent_loop.process_direct(
+                message,
+                session_key="gradio:default",
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            )
+            q.put(("done", result))
+
+        new_loop.run_until_complete(_task())
+        new_loop.close()
+
+    t = threading.Thread(target=_run_agent, daemon=True)
+    t.start()
+
+    accumulated = ""
+    latest_progress: str = ""
+
+    while t.is_alive() or not q.empty():
+        try:
+            msg_type, data = q.get(timeout=0.15)
+        except queue.Empty:
+            # 等待中：显示最新进度提示
+            display = latest_progress if latest_progress else " 思考中..."
+            yield base_history + [{"role": "assistant", "content": display}]
+            continue
+
+        if msg_type == "progress":
+            latest_progress = f"✦ {data}"
+            yield base_history + [{"role": "assistant", "content": latest_progress}]
+
+        elif msg_type == "stream":
+            accumulated += data
+            yield base_history + [{"role": "assistant", "content": accumulated}]
+
+        elif msg_type == "done":
+            result = data
+            final_text = result.content if result and result.content else "抱歉，未能生成回复。"
+            final_text = _fix_image_paths(final_text)
+            yield base_history + [{"role": "assistant", "content": final_text}]
+            break
+
+    t.join(timeout=1)
 
 
 def clear_history():
-    """清空对话历史"""
-    _session_raw_history.clear()
     return []
 
 
@@ -104,7 +140,6 @@ def create_ui():
     .main-header p { color: #666; font-size: 0.9rem; }
     footer { display: none !important; }
     """
-
     with gr.Blocks(
         css=custom_css,
         title="股票查询助手",
@@ -156,8 +191,8 @@ def create_ui():
         也可查询其他股票，系统会自动从 Tushare 拉取数据
         """)
 
-        # 事件绑定
-        send_fn = submit_btn.click(
+        # 事件绑定 - 使用 generator 实现流式
+        submit_btn.click(
             fn=chat_handler,
             inputs=[msg, chatbot],
             outputs=[chatbot],
@@ -190,15 +225,20 @@ def main():
 
     print("=" * 50)
     print("  股票查询助手 Web UI 已启动")
-    print(f"  本地访问: http://localhost:7861")
+    print(f"  本地访问: http://localhost:7868")
     print(f"  图片目录: {IMAGE_SHOW_DIR}")
     print("=" * 50)
 
+    os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+    os.environ["no_proxy"] = "localhost,127.0.0.1,0.0.0.0"
+
     demo.queue(default_concurrency_limit=3).launch(
         server_name="0.0.0.0",
-        server_port=7861,
+        server_port=7868,
         share=False,
         show_error=True,
+        quiet=True,
+        show_api=False,
         allowed_paths=[str(IMAGE_SHOW_DIR)],
     )
 
